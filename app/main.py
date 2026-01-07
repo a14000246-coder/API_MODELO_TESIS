@@ -1,14 +1,18 @@
 import os
 from datetime import datetime
 from ftplib import FTP, error_perm
+from io import StringIO
 
 import pandas as pd
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from app.settings import API_KEY, DATA_PATH, MODELS_DIR
-from app.ml import train_from_csv, predict_from_row
+from app.ml import train_from_csv, predict_from_row, load_latest  # 👈 añadimos load_latest
+
+import numpy as np
+import xgboost as xgb
 
 app = FastAPI(title="API Modelo Producción (XGBoost)")
 
@@ -28,11 +32,7 @@ FTP_PORT = int(os.getenv("FTP_PORT", "21"))
 FTP_USER = os.getenv("FTP_USER", "").strip()
 FTP_PASS = os.getenv("FTP_PASS", "").strip()
 
-# Carpeta remota donde se guardarán los archivos
-# Ejemplos comunes:
-#   "/public_html/exports"
-#   "/htdocs/exports"
-#   "/exports"
+# Ruta remota donde se guardarán los archivos
 FTP_DIR = os.getenv("FTP_DIR", "/exports").strip()
 
 # Activa/desactiva subida automática
@@ -43,15 +43,12 @@ UPLOAD_ENABLED = os.getenv("UPLOAD_ENABLED", "1").strip()  # "1" o "0"
 # =========================
 LOG_PATH = os.path.join(MODELS_DIR, "predictions_log.csv")
 METRICS_PATH = os.path.join(MODELS_DIR, "metrics_latest.json")
-
+FORECAST_PATH = os.path.join(MODELS_DIR, "forecast_26w.csv")  # 👈 nuevo
 
 # =========================
 # FTP helpers
 # =========================
 def _ftp_ensure_dir(ftp: FTP, remote_dir: str):
-    """
-    Crea (si hace falta) una ruta remota tipo /a/b/c y entra a ella.
-    """
     parts = [p for p in remote_dir.split("/") if p]
     for p in parts:
         try:
@@ -60,15 +57,10 @@ def _ftp_ensure_dir(ftp: FTP, remote_dir: str):
             ftp.mkd(p)
             ftp.cwd(p)
 
-
 def ftp_upload(local_path: str, remote_filename: str):
-    """
-    Sube un archivo local a FTP_DIR/remote_filename
-    """
     if UPLOAD_ENABLED != "1":
         return
     if not (FTP_HOST and FTP_USER and FTP_PASS):
-        # No rompe la API si no se configuró FTP en Render
         return
     if not os.path.exists(local_path):
         return
@@ -111,21 +103,19 @@ def health():
 def train(x_api_key: str | None = Header(default=None)):
     check_key(x_api_key)
 
-    # Entrena y guarda artifacts (incluye metrics_latest.json)
     metrics = train_from_csv(DATA_PATH, MODELS_DIR)
 
-    # Subir métricas al hosting por FTP
+    # subir métricas por FTP
     try:
         ftp_upload(METRICS_PATH, "metrics_latest.json")
     except Exception as e:
-        # No rompe el entrenamiento; se ve en logs de Render
         print("WARNING: Falló upload FTP metrics_latest.json:", repr(e))
 
     return {"trained": True, "metrics": metrics}
 
 
 # =========================
-# Predicción + log CSV + subida automática (FTP)
+# Predicción + log CSV + subida FTP
 # =========================
 @app.post("/predict")
 def predict(req: PredictRequest, x_api_key: str | None = Header(default=None)):
@@ -133,10 +123,8 @@ def predict(req: PredictRequest, x_api_key: str | None = Header(default=None)):
 
     result = predict_from_row(MODELS_DIR, req.row)
 
-    # Asegurar carpeta local
     os.makedirs(MODELS_DIR, exist_ok=True)
 
-    # Log: entrada + salida
     row_log = {
         "timestamp": datetime.now().isoformat(),
         **req.row,
@@ -145,19 +133,116 @@ def predict(req: PredictRequest, x_api_key: str | None = Header(default=None)):
 
     df_log = pd.DataFrame([row_log])
 
-    # Append a CSV
     if os.path.exists(LOG_PATH):
         df_log.to_csv(LOG_PATH, mode="a", header=False, index=False)
     else:
         df_log.to_csv(LOG_PATH, mode="w", header=True, index=False)
 
-    # Subir CSV al hosting por FTP
     try:
         ftp_upload(LOG_PATH, "predictions_log.csv")
     except Exception as e:
         print("WARNING: Falló upload FTP predictions_log.csv:", repr(e))
 
     return result
+
+
+# =========================
+# NUEVO: Forecast 26 semanas (racimos + cajas)
+# =========================
+def _build_base_row_from_csv(csv_path: str, features: list[str]):
+    """
+    Toma la última fila del CSV para usarla como base de features.
+    """
+    df = pd.read_csv(csv_path)
+    last_date = None
+
+    if "Fecha" in df.columns:
+        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+        df = df.sort_values("Fecha")
+        ld = df["Fecha"].dropna().max()
+        if pd.notna(ld):
+            last_date = ld
+
+    base = df.tail(1).to_dict(orient="records")[0] if len(df) else {}
+    base.pop("RACIMOS COSECHADOS", None)
+    base.pop("CAJAS PROCESADAS", None)
+
+    row = {}
+    for col in features:
+        row[col] = base.get(col, np.nan)
+
+    return row, last_date
+
+
+@app.get("/forecast/26w")
+def forecast_26w(x_api_key: str | None = Header(default=None), export_csv: int = 0):
+    """
+    Genera predicción semanal para las próximas 26 semanas:
+    - pred_racimos
+    - pred_cajas
+
+    Parámetros:
+      export_csv=1  -> devuelve CSV para descargar
+      export_csv=0  -> devuelve JSON
+    """
+    check_key(x_api_key)
+
+    mr, mc, features = load_latest(MODELS_DIR)
+
+    base_row, last_date = _build_base_row_from_csv(DATA_PATH, features)
+
+    # Fecha base: si no hay, hoy
+    base_date = last_date if last_date is not None else pd.Timestamp.today()
+
+    future_dates = pd.date_range(base_date + pd.Timedelta(days=7), periods=26, freq="W")
+
+    preds = []
+    row = dict(base_row)
+
+    for fdate in future_dates:
+        X = pd.DataFrame([row])
+
+        for col in features:
+            if col not in X.columns:
+                X[col] = np.nan
+        X = X[features]
+
+        dmat = xgb.DMatrix(X)
+        pr = float(mr.predict(dmat)[0])
+        pc = float(mc.predict(dmat)[0])
+
+        preds.append({
+            "fecha": fdate.date().isoformat(),
+            "semana": int(fdate.isocalendar().week),
+            "pred_racimos": pr,
+            "pred_cajas": pc
+        })
+
+        # Alimentación recursiva solo si existen lags de targets
+        for d in (7, 14, 30, 60):
+            k_r = f"RACIMOS COSECHADOS_lag_{d}"
+            k_c = f"CAJAS PROCESADAS_lag_{d}"
+            if k_r in row:
+                row[k_r] = pr
+            if k_c in row:
+                row[k_c] = pc
+
+    # Guardar CSV local (para auditoría o para subir a FTP si quieres)
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    df_forecast = pd.DataFrame(preds)
+    df_forecast.to_csv(FORECAST_PATH, index=False)
+
+    # Subir forecast al FTP (opcional: si quieres que exista en /exports)
+    try:
+        ftp_upload(FORECAST_PATH, "forecast_26w.csv")
+    except Exception as e:
+        print("WARNING: Falló upload FTP forecast_26w.csv:", repr(e))
+
+    if export_csv == 1:
+        csv_data = df_forecast.to_csv(index=False)
+        return Response(content=csv_data, media_type="text/csv")
+
+    return {"horizon_weeks": 26, "predictions": preds}
 
 
 # =========================
