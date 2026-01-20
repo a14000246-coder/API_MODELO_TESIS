@@ -4,20 +4,19 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 from datetime import datetime
-from xgboost.callback import EarlyStopping
-from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 TARGETS = ["RACIMOS COSECHADOS", "CAJAS PROCESADAS"]
 
 
 # =========================
-# NUEVO: Preprocesamiento mensual (para proyección por meses)
+# Preprocesamiento mensual (para proyección por meses)
 # =========================
 def monthly_aggregate(df: pd.DataFrame) -> pd.DataFrame:
     """Agrega el dataset a nivel mensual y crea lags/rolling para mejorar la variabilidad.
     - Targets (RACIMOS COSECHADOS, CAJAS PROCESADAS): SUMA mensual.
-    - Otras variables numéricas: PROMEDIO mensual (ajusta a SUMA si corresponde en tu caso).
+    - Otras variables: PROMEDIO mensual (ajusta a SUMA si corresponde en tu caso).
     - Dirección del viento: moda mensual (si existe).
     """
     df = df.copy()
@@ -28,8 +27,7 @@ def monthly_aggregate(df: pd.DataFrame) -> pd.DataFrame:
     df["MesFecha"] = df["Fecha"].dt.to_period("M").dt.to_timestamp()
 
     sum_cols = [c for c in TARGETS if c in df.columns]
-    # Nota: aquí promediamos el resto de columnas numéricas. Si tienes "Precipitación" diaria en mm/día,
-    # puede convenirte sumar (total mensual) en vez de promediar.
+
     base_exclude = set(["Fecha", "MesFecha"])
     agg_dict = {}
 
@@ -52,6 +50,7 @@ def monthly_aggregate(df: pd.DataFrame) -> pd.DataFrame:
         def mode_or_nan(s):
             s = s.dropna()
             return s.mode().iloc[0] if len(s) else np.nan
+
         wind = df.groupby("MesFecha")["Dirección del viento"].apply(mode_or_nan).reset_index()
         monthly = monthly.merge(wind, on="MesFecha", how="left")
 
@@ -102,9 +101,10 @@ def preprocess_monthly(df: pd.DataFrame):
     y2 = dfm[TARGETS[1]]
     return X, y1, y2, features
 
+
 def preprocess(df: pd.DataFrame):
     df = df.copy()
-    df["Fecha"] = pd.to_datetime(df["Fecha"])
+    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
 
     if "Dirección del viento" in df.columns:
         df = pd.get_dummies(df, columns=["Dirección del viento"], drop_first=True)
@@ -117,6 +117,7 @@ def preprocess(df: pd.DataFrame):
     y2 = df[TARGETS[1]]
     return X, y1, y2, features
 
+
 def _metrics(y_true, y_pred):
     return {
         "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
@@ -126,23 +127,28 @@ def _metrics(y_true, y_pred):
 
 
 def _pick_top_features(model: xgb.XGBRegressor, feature_names: list[str], top_k: int = 35) -> list[str]:
-    """Selecciona features por importancia (gain/weight aproximado vía feature_importances_)."""
+    """Selecciona features por importancia vía feature_importances_ (gain aproximado)."""
     importances = getattr(model, "feature_importances_", None)
     if importances is None or len(importances) != len(feature_names):
         return feature_names
 
-    # Orden descendente por importancia
     pairs = sorted(zip(feature_names, importances), key=lambda t: t[1], reverse=True)
-
-    # Quitar ceros (ruido) y limitar a top_k
     kept = [f for f, imp in pairs if imp > 0]
     if not kept:
         kept = feature_names
     return kept[: min(top_k, len(kept))]
 
 
-def _train_with_params_ts(X: pd.DataFrame, y: pd.Series, params: dict, n_splits: int = 5, log1p: bool = True):
-    """Evalúa un set de hiperparámetros con validación temporal (TimeSeriesSplit)."""
+def _train_with_params_ts(
+    X: pd.DataFrame,
+    y: pd.Series,
+    params: dict,
+    n_splits: int = 5,
+    log1p: bool = True
+):
+    """Evalúa hiperparámetros con validación temporal (TimeSeriesSplit)."""
+    # Por seguridad: con muy pocos puntos mensuales, bajar splits
+    n_splits = min(n_splits, max(2, len(X) - 2))
     tscv = TimeSeriesSplit(n_splits=n_splits)
     rmses = []
 
@@ -153,26 +159,29 @@ def _train_with_params_ts(X: pd.DataFrame, y: pd.Series, params: dict, n_splits:
         if log1p:
             y_tr_fit = np.log1p(y_tr)
             y_val_true = y_val
+            y_val_fit = np.log1p(y_val)
         else:
             y_tr_fit = y_tr
             y_val_true = y_val
+            y_val_fit = y_val
 
         m = xgb.XGBRegressor(**params)
+        # ✅ Sin early stopping (compatibilidad Render)
         m.fit(
             X_tr,
-            y_tr,
-            eval_set=[(X_val, y_val)],
-            verbose=False,
-            callbacks=[EarlyStopping(rounds=50, save_best=True)]
+            y_tr_fit,
+            eval_set=[(X_val, y_val_fit)],
+            verbose=False
         )
 
         pred = m.predict(X_val)
         if log1p:
             pred = np.expm1(pred)
+
         rmse = float(np.sqrt(mean_squared_error(y_val_true, pred)))
         rmses.append(rmse)
 
-    return float(np.mean(rmses))
+    return float(np.mean(rmses)) if rmses else float("inf")
 
 
 def train_one(
@@ -186,11 +195,11 @@ def train_one(
     """Fase 1:
     - Validación temporal (TimeSeriesSplit)
     - Búsqueda pequeña de hiperparámetros
-    - Transformación log1p del target (opcional)
+    - Transformación log1p del target
     - Selección de features por importancia
     """
 
-    # Si vienen features fijas (p. ej. seleccionadas con racimos), usar solo esas
+    # Si vienen features fijas (p.ej. seleccionadas con racimos), usar solo esas
     if fixed_features is not None:
         X = X[fixed_features]
 
@@ -199,7 +208,6 @@ def train_one(
     X_train, X_test = X.iloc[:split], X.iloc[split:]
     y_train, y_test = y.iloc[:split], y.iloc[split:]
 
-    # Base params (sensatos para series)
     base = {
         "objective": "reg:squarederror",
         "random_state": 42,
@@ -207,12 +215,19 @@ def train_one(
         "tree_method": "hist",
     }
 
-    # Pequeña búsqueda (rápida) – puedes ampliar luego
+    # ✅ Candidatos más livianos y con regularización (mejor para Render sin early stopping)
     candidates = [
-        {**base, "learning_rate": 0.03, "max_depth": 6, "min_child_weight": 3, "subsample": 0.85, "colsample_bytree": 0.85, "gamma": 0.05, "reg_alpha": 0.0, "reg_lambda": 1.0, "n_estimators": 3000},
-        {**base, "learning_rate": 0.05, "max_depth": 5, "min_child_weight": 5, "subsample": 0.8,  "colsample_bytree": 0.8,  "gamma": 0.1,  "reg_alpha": 0.0, "reg_lambda": 1.2, "n_estimators": 2500},
-        {**base, "learning_rate": 0.02, "max_depth": 7, "min_child_weight": 2, "subsample": 0.9,  "colsample_bytree": 0.9,  "gamma": 0.0,  "reg_alpha": 0.0, "reg_lambda": 1.0, "n_estimators": 4000},
-        {**base, "learning_rate": 0.03, "max_depth": 4, "min_child_weight": 8, "subsample": 0.8,  "colsample_bytree": 0.9,  "gamma": 0.15, "reg_alpha": 0.0, "reg_lambda": 1.5, "n_estimators": 3000},
+        {**base, "learning_rate": 0.03, "max_depth": 6, "min_child_weight": 3,
+         "subsample": 0.8, "colsample_bytree": 0.8, "gamma": 0.1,
+         "reg_alpha": 0.5, "reg_lambda": 2.0, "n_estimators": 900},
+
+        {**base, "learning_rate": 0.025, "max_depth": 5, "min_child_weight": 4,
+         "subsample": 0.85, "colsample_bytree": 0.85, "gamma": 0.15,
+         "reg_alpha": 1.0, "reg_lambda": 3.0, "n_estimators": 1100},
+
+        {**base, "learning_rate": 0.04, "max_depth": 7, "min_child_weight": 2,
+         "subsample": 0.75, "colsample_bytree": 0.75, "gamma": 0.05,
+         "reg_alpha": 0.3, "reg_lambda": 1.5, "n_estimators": 700},
     ]
 
     # Elegir mejor set por CV temporal
@@ -224,17 +239,21 @@ def train_one(
             best_rmse = rmse_cv
             best_params = params
 
+    if best_params is None:
+        best_params = candidates[0]
+        best_rmse = float("inf")
+
     # Entrenamiento inicial con best params
     y_train_fit = np.log1p(y_train) if log1p else y_train
     y_test_true = y_test
+    y_test_fit = np.log1p(y_test) if log1p else y_test
 
     model = xgb.XGBRegressor(**best_params)
     model.fit(
         X_train,
         y_train_fit,
-        eval_set=[(X_test, np.log1p(y_test) if log1p else y_test)],
-        verbose=False,
-        early_stopping_rounds=50,
+        eval_set=[(X_test, y_test_fit)],
+        verbose=False
     )
 
     # Selección de features (si no vienen fijas) y re-entrenamiento final
@@ -247,9 +266,8 @@ def train_one(
     model2.fit(
         X_train_s,
         y_train_fit,
-        eval_set=[(X_test_s, np.log1p(y_test) if log1p else y_test)],
-        verbose=False,
-        early_stopping_rounds=50,
+        eval_set=[(X_test_s, y_test_fit)],
+        verbose=False
     )
 
     pred = model2.predict(X_test_s)
@@ -257,10 +275,10 @@ def train_one(
         pred = np.expm1(pred)
 
     m = _metrics(y_test_true, pred)
-    # Añadir info útil
     m["cv_rmse_mean"] = float(best_rmse)
     m["selected_features"] = int(len(selected))
     m["target_transform"] = "log1p" if log1p else "none"
+    m["best_params"] = {k: best_params[k] for k in best_params if k not in ("n_jobs",)}  # opcional
     return model2, m, selected
 
 
@@ -272,13 +290,14 @@ def load_metrics(models_dir: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
+
 
 def save_artifacts(models_dir: str, model_r, model_c, features, metrics):
     ensure_dir(models_dir)
 
-    # Guardar boosters (evita error _estimator_type)
     booster_r = model_r.get_booster()
     booster_c = model_c.get_booster()
 
@@ -297,6 +316,7 @@ def save_artifacts(models_dir: str, model_r, model_c, features, metrics):
     booster_r.save_model(os.path.join(models_dir, f"model_racimos_{stamp}.json"))
     booster_c.save_model(os.path.join(models_dir, f"model_cajas_{stamp}.json"))
 
+
 def load_latest(models_dir: str):
     mr = xgb.Booster()
     mc = xgb.Booster()
@@ -309,12 +329,14 @@ def load_latest(models_dir: str):
 
     return mr, mc, features
 
+
 def train_from_csv(csv_path: str, models_dir: str, granularity: str = "daily"):
     df = pd.read_csv(csv_path)
+
     if granularity == "monthly":
-        X, y_r, y_c, features = preprocess_monthly(df)
+        X, y_r, y_c, _features = preprocess_monthly(df)
     else:
-        X, y_r, y_c, features = preprocess(df)
+        X, y_r, y_c, _features = preprocess(df)
 
     # Entrenamos RACIMOS primero y usamos sus features seleccionadas
     model_r, m1, selected = train_one(X, y_r, log1p=True, top_k=35)
@@ -328,8 +350,10 @@ def train_from_csv(csv_path: str, models_dir: str, granularity: str = "daily"):
         "features_count": int(len(selected)),
         "granularity": granularity,
     }
+
     save_artifacts(models_dir, model_r, model_c, selected, metrics)
     return metrics
+
 
 def predict_from_row(models_dir: str, row: dict):
     mr, mc, features = load_latest(models_dir)
@@ -359,4 +383,3 @@ def predict_from_row(models_dir: str, row: dict):
         pass
 
     return {"pred_racimos": pr, "pred_cajas": pc}
-
