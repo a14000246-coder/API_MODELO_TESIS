@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 from datetime import datetime
+from xgboost.callback import EarlyStopping
 from sklearn.model_selection import train_test_split, TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
@@ -159,10 +160,10 @@ def _train_with_params_ts(X: pd.DataFrame, y: pd.Series, params: dict, n_splits:
         m = xgb.XGBRegressor(**params)
         m.fit(
             X_tr,
-            y_tr_fit,
-            eval_set=[(X_val, np.log1p(y_val) if log1p else y_val)],
+            y_tr,
+            eval_set=[(X_val, y_val)],
             verbose=False,
-            early_stopping_rounds=50,
+            callbacks=[EarlyStopping(rounds=50, save_best=True)]
         )
 
         pred = m.predict(X_val)
