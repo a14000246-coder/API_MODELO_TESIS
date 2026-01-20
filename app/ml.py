@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 from datetime import datetime
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 TARGETS = ["RACIMOS COSECHADOS", "CAJAS PROCESADAS"]
@@ -116,29 +116,160 @@ def preprocess(df: pd.DataFrame):
     y2 = df[TARGETS[1]]
     return X, y1, y2, features
 
-def train_one(X, y):
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, shuffle=False
-    )
-    model = xgb.XGBRegressor(
-        objective="reg:squarederror",
-        n_estimators=600,
-        learning_rate=0.03,
-        max_depth=4,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=5,
-        gamma=0.1,
-        random_state=42,
-        n_jobs=-1
-    )
-    model.fit(X_train, y_train)
-    pred = model.predict(X_test)
+def _metrics(y_true, y_pred):
+    return {
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "r2": float(r2_score(y_true, y_pred)),
+    }
 
-    rmse = float(np.sqrt(mean_squared_error(y_test, pred)))
-    mae = float(mean_absolute_error(y_test, pred))
-    r2 = float(r2_score(y_test, pred))
-    return model, {"rmse": rmse, "mae": mae, "r2": r2}
+
+def _pick_top_features(model: xgb.XGBRegressor, feature_names: list[str], top_k: int = 35) -> list[str]:
+    """Selecciona features por importancia (gain/weight aproximado vía feature_importances_)."""
+    importances = getattr(model, "feature_importances_", None)
+    if importances is None or len(importances) != len(feature_names):
+        return feature_names
+
+    # Orden descendente por importancia
+    pairs = sorted(zip(feature_names, importances), key=lambda t: t[1], reverse=True)
+
+    # Quitar ceros (ruido) y limitar a top_k
+    kept = [f for f, imp in pairs if imp > 0]
+    if not kept:
+        kept = feature_names
+    return kept[: min(top_k, len(kept))]
+
+
+def _train_with_params_ts(X: pd.DataFrame, y: pd.Series, params: dict, n_splits: int = 5, log1p: bool = True):
+    """Evalúa un set de hiperparámetros con validación temporal (TimeSeriesSplit)."""
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    rmses = []
+
+    for train_idx, val_idx in tscv.split(X):
+        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+        if log1p:
+            y_tr_fit = np.log1p(y_tr)
+            y_val_true = y_val
+        else:
+            y_tr_fit = y_tr
+            y_val_true = y_val
+
+        m = xgb.XGBRegressor(**params)
+        m.fit(
+            X_tr,
+            y_tr_fit,
+            eval_set=[(X_val, np.log1p(y_val) if log1p else y_val)],
+            verbose=False,
+            early_stopping_rounds=50,
+        )
+
+        pred = m.predict(X_val)
+        if log1p:
+            pred = np.expm1(pred)
+        rmse = float(np.sqrt(mean_squared_error(y_val_true, pred)))
+        rmses.append(rmse)
+
+    return float(np.mean(rmses))
+
+
+def train_one(
+    X: pd.DataFrame,
+    y: pd.Series,
+    *,
+    log1p: bool = True,
+    top_k: int = 35,
+    fixed_features: list[str] | None = None,
+):
+    """Fase 1:
+    - Validación temporal (TimeSeriesSplit)
+    - Búsqueda pequeña de hiperparámetros
+    - Transformación log1p del target (opcional)
+    - Selección de features por importancia
+    """
+
+    # Si vienen features fijas (p. ej. seleccionadas con racimos), usar solo esas
+    if fixed_features is not None:
+        X = X[fixed_features]
+
+    # Split final (último 20% como test)
+    split = int(len(X) * 0.8)
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+    # Base params (sensatos para series)
+    base = {
+        "objective": "reg:squarederror",
+        "random_state": 42,
+        "n_jobs": -1,
+        "tree_method": "hist",
+    }
+
+    # Pequeña búsqueda (rápida) – puedes ampliar luego
+    candidates = [
+        {**base, "learning_rate": 0.03, "max_depth": 6, "min_child_weight": 3, "subsample": 0.85, "colsample_bytree": 0.85, "gamma": 0.05, "reg_alpha": 0.0, "reg_lambda": 1.0, "n_estimators": 3000},
+        {**base, "learning_rate": 0.05, "max_depth": 5, "min_child_weight": 5, "subsample": 0.8,  "colsample_bytree": 0.8,  "gamma": 0.1,  "reg_alpha": 0.0, "reg_lambda": 1.2, "n_estimators": 2500},
+        {**base, "learning_rate": 0.02, "max_depth": 7, "min_child_weight": 2, "subsample": 0.9,  "colsample_bytree": 0.9,  "gamma": 0.0,  "reg_alpha": 0.0, "reg_lambda": 1.0, "n_estimators": 4000},
+        {**base, "learning_rate": 0.03, "max_depth": 4, "min_child_weight": 8, "subsample": 0.8,  "colsample_bytree": 0.9,  "gamma": 0.15, "reg_alpha": 0.0, "reg_lambda": 1.5, "n_estimators": 3000},
+    ]
+
+    # Elegir mejor set por CV temporal
+    best_params = None
+    best_rmse = float("inf")
+    for params in candidates:
+        rmse_cv = _train_with_params_ts(X_train, y_train, params, n_splits=5, log1p=log1p)
+        if rmse_cv < best_rmse:
+            best_rmse = rmse_cv
+            best_params = params
+
+    # Entrenamiento inicial con best params
+    y_train_fit = np.log1p(y_train) if log1p else y_train
+    y_test_true = y_test
+
+    model = xgb.XGBRegressor(**best_params)
+    model.fit(
+        X_train,
+        y_train_fit,
+        eval_set=[(X_test, np.log1p(y_test) if log1p else y_test)],
+        verbose=False,
+        early_stopping_rounds=50,
+    )
+
+    # Selección de features (si no vienen fijas) y re-entrenamiento final
+    selected = fixed_features if fixed_features is not None else _pick_top_features(model, list(X.columns), top_k=top_k)
+
+    X_train_s = X_train[selected]
+    X_test_s = X_test[selected]
+
+    model2 = xgb.XGBRegressor(**best_params)
+    model2.fit(
+        X_train_s,
+        y_train_fit,
+        eval_set=[(X_test_s, np.log1p(y_test) if log1p else y_test)],
+        verbose=False,
+        early_stopping_rounds=50,
+    )
+
+    pred = model2.predict(X_test_s)
+    if log1p:
+        pred = np.expm1(pred)
+
+    m = _metrics(y_test_true, pred)
+    # Añadir info útil
+    m["cv_rmse_mean"] = float(best_rmse)
+    m["selected_features"] = int(len(selected))
+    m["target_transform"] = "log1p" if log1p else "none"
+    return model2, m, selected
+
+
+def load_metrics(models_dir: str) -> dict:
+    """Lee metrics_latest.json si existe."""
+    path = os.path.join(models_dir, "metrics_latest.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
@@ -184,21 +315,24 @@ def train_from_csv(csv_path: str, models_dir: str, granularity: str = "daily"):
     else:
         X, y_r, y_c, features = preprocess(df)
 
-    model_r, m1 = train_one(X, y_r)
-    model_c, m2 = train_one(X, y_c)
+    # Entrenamos RACIMOS primero y usamos sus features seleccionadas
+    model_r, m1, selected = train_one(X, y_r, log1p=True, top_k=35)
+    # Entrenamos CAJAS con las mismas features (evita mismatch en inferencia)
+    model_c, m2, _ = train_one(X, y_c, log1p=True, fixed_features=selected)
 
     metrics = {
         "racimos": m1,
         "cajas": m2,
         "rows": int(len(df)),
-        "features_count": int(len(features)),
+        "features_count": int(len(selected)),
         "granularity": granularity,
     }
-    save_artifacts(models_dir, model_r, model_c, features, metrics)
+    save_artifacts(models_dir, model_r, model_c, selected, metrics)
     return metrics
 
 def predict_from_row(models_dir: str, row: dict):
     mr, mc, features = load_latest(models_dir)
+    meta = load_metrics(models_dir)
 
     X = pd.DataFrame([row])
 
@@ -211,6 +345,17 @@ def predict_from_row(models_dir: str, row: dict):
 
     pr = float(mr.predict(dmatrix)[0])
     pc = float(mc.predict(dmatrix)[0])
+
+    # Si entrenamos con log1p, invertimos a escala real
+    try:
+        tr_r = meta.get("racimos", {}).get("target_transform")
+        tr_c = meta.get("cajas", {}).get("target_transform")
+        if tr_r == "log1p":
+            pr = float(np.expm1(pr))
+        if tr_c == "log1p":
+            pc = float(np.expm1(pc))
+    except Exception:
+        pass
 
     return {"pred_racimos": pr, "pred_cajas": pc}
 

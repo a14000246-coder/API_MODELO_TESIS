@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from app.settings import API_KEY, DATA_PATH, MODELS_DIR
-from app.ml import train_from_csv, predict_from_row, load_latest, monthly_aggregate  # 👈 añadimos load_latest
+from app.ml import train_from_csv, predict_from_row, load_latest, monthly_aggregate, load_metrics  # 👈 añadimos load_latest
 
 import numpy as np
 import xgboost as xgb
@@ -209,6 +209,9 @@ def forecast_26w(x_api_key: str | None = Header(default=None), export_csv: int =
     check_key(x_api_key)
 
     mr, mc, features = load_latest(MODELS_DIR)
+    meta = load_metrics(MODELS_DIR)
+    tr_r = meta.get("racimos", {}).get("target_transform")
+    tr_c = meta.get("cajas", {}).get("target_transform")
 
     base_row, last_date = _build_base_row_from_csv(DATA_PATH, features)
 
@@ -231,6 +234,12 @@ def forecast_26w(x_api_key: str | None = Header(default=None), export_csv: int =
         dmat = xgb.DMatrix(X)
         pr = float(mr.predict(dmat)[0])
         pc = float(mc.predict(dmat)[0])
+
+        # Invertir si el modelo fue entrenado con log1p
+        if tr_r == "log1p":
+            pr = float(np.expm1(pr))
+        if tr_c == "log1p":
+            pc = float(np.expm1(pc))
 
         preds.append({
             "fecha": fdate.date().isoformat(),
@@ -283,6 +292,9 @@ def forecast_36m(x_api_key: str | None = Header(default=None), export_csv: int =
     check_key(x_api_key)
 
     mr, mc, features = load_latest(MODELS_DIR)
+    meta = load_metrics(MODELS_DIR)
+    tr_r = meta.get("racimos", {}).get("target_transform")
+    tr_c = meta.get("cajas", {}).get("target_transform")
 
     base_row, last_date, dfm = _build_base_row_monthly_from_csv(DATA_PATH, features)
 
@@ -357,6 +369,12 @@ def forecast_36m(x_api_key: str | None = Header(default=None), export_csv: int =
         dmat = xgb.DMatrix(X)
         pr = float(mr.predict(dmat)[0])
         pc = float(mc.predict(dmat)[0])
+
+        # Invertir si el modelo fue entrenado con log1p
+        if tr_r == "log1p":
+            pr = float(np.expm1(pr))
+        if tr_c == "log1p":
+            pc = float(np.expm1(pc))
 
         preds.append({
             "mes": fdate.strftime("%Y-%m"),
