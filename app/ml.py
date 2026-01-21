@@ -20,6 +20,12 @@ def monthly_aggregate(df: pd.DataFrame) -> pd.DataFrame:
     - Dirección del viento: moda mensual (si existe).
     """
     df = df.copy()
+
+    # ✅ Fix de nombres con mala codificación (mojibake)
+    df = df.rename(columns={
+        "PrecipitaciÃ³n (%)": "Precipitación (%)"
+    })
+
     df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
     df = df.dropna(subset=["Fecha"]).sort_values("Fecha")
 
@@ -34,11 +40,15 @@ def monthly_aggregate(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
         if c in base_exclude:
             continue
+
         if c in sum_cols:
             agg_dict[c] = "sum"
         elif c == "Dirección del viento":
             # la tratamos aparte
             continue
+        elif c in ["Precipitación (%)", "Precipitacion (%)", "PrecipitaciÃ³n (%)"]:
+            # ✅ Es porcentaje -> promedio mensual, no suma
+            agg_dict[c] = "mean"
         else:
             # por defecto: promedio mensual
             agg_dict[c] = "mean"
@@ -55,6 +65,10 @@ def monthly_aggregate(df: pd.DataFrame) -> pd.DataFrame:
         monthly = monthly.merge(wind, on="MesFecha", how="left")
 
     monthly = monthly.rename(columns={"MesFecha": "Fecha"}).sort_values("Fecha")
+
+    # ✅ Feature derivada: aproximación de "días con lluvia"
+    if "Precipitación (%)" in monthly.columns:
+        monthly["Dias_lluvia_aprox"] = (monthly["Precipitación (%)"].astype(float) / 100.0) * 30.0
 
     # ============================
     # LAGS MENSUALES (1,2,3,6,12)
@@ -104,6 +118,12 @@ def preprocess_monthly(df: pd.DataFrame):
 
 def preprocess(df: pd.DataFrame):
     df = df.copy()
+
+    # ✅ Fix de nombres con mala codificación (por si entrenas daily)
+    df = df.rename(columns={
+        "PrecipitaciÃ³n (%)": "Precipitación (%)"
+    })
+
     df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
 
     if "Dirección del viento" in df.columns:
@@ -126,28 +146,31 @@ def _metrics(y_true, y_pred):
     }
 
 
-def _pick_top_features(model: xgb.XGBRegressor, feature_names: list[str], top_k: int = 35) -> list[str]:
-    """Selecciona features por importancia vía feature_importances_ (gain aproximado)."""
-    importances = getattr(model, "feature_importances_", None)
-    if importances is None or len(importances) != len(feature_names):
-        return feature_names
+def _pick_top_features(model: xgb.XGBRegressor, feature_names: list[str], top_k: int = 45) -> list[str]:
+    """Selecciona features por GAIN (más estable que feature_importances_)."""
+    try:
+        booster = model.get_booster()
+        score = booster.get_score(importance_type="gain")
+        if not score:
+            return feature_names[: min(top_k, len(feature_names))]
 
-    pairs = sorted(zip(feature_names, importances), key=lambda t: t[1], reverse=True)
-    kept = [f for f, imp in pairs if imp > 0]
-    if not kept:
-        kept = feature_names
-    return kept[: min(top_k, len(kept))]
+        pairs = sorted(score.items(), key=lambda x: x[1], reverse=True)
+        kept = [k for k, _ in pairs if k in feature_names]
+        if not kept:
+            return feature_names[: min(top_k, len(feature_names))]
+        return kept[: min(top_k, len(kept))]
+    except Exception:
+        return feature_names[: min(top_k, len(feature_names))]
 
 
 def _train_with_params_ts(
     X: pd.DataFrame,
     y: pd.Series,
     params: dict,
-    n_splits: int = 5,
+    n_splits: int = 3,
     log1p: bool = True
 ):
     """Evalúa hiperparámetros con validación temporal (TimeSeriesSplit)."""
-    # Por seguridad: con muy pocos puntos mensuales, bajar splits
     n_splits = min(n_splits, max(2, len(X) - 2))
     tscv = TimeSeriesSplit(n_splits=n_splits)
     rmses = []
@@ -189,17 +212,16 @@ def train_one(
     y: pd.Series,
     *,
     log1p: bool = True,
-    top_k: int = 35,
+    top_k: int = 45,
     fixed_features: list[str] | None = None,
 ):
     """Fase 1:
     - Validación temporal (TimeSeriesSplit)
     - Búsqueda pequeña de hiperparámetros
     - Transformación log1p del target
-    - Selección de features por importancia
+    - Selección de features por GAIN
     """
 
-    # Si vienen features fijas (p.ej. seleccionadas con racimos), usar solo esas
     if fixed_features is not None:
         X = X[fixed_features]
 
@@ -215,7 +237,6 @@ def train_one(
         "tree_method": "hist",
     }
 
-    # ✅ Candidatos más livianos y con regularización (mejor para Render sin early stopping)
     candidates = [
         {**base, "learning_rate": 0.03, "max_depth": 6, "min_child_weight": 3,
          "subsample": 0.8, "colsample_bytree": 0.8, "gamma": 0.1,
@@ -230,11 +251,10 @@ def train_one(
          "reg_alpha": 0.3, "reg_lambda": 1.5, "n_estimators": 700},
     ]
 
-    # Elegir mejor set por CV temporal
     best_params = None
     best_rmse = float("inf")
     for params in candidates:
-        rmse_cv = _train_with_params_ts(X_train, y_train, params, n_splits=5, log1p=log1p)
+        rmse_cv = _train_with_params_ts(X_train, y_train, params, n_splits=3, log1p=log1p)
         if rmse_cv < best_rmse:
             best_rmse = rmse_cv
             best_params = params
@@ -243,7 +263,6 @@ def train_one(
         best_params = candidates[0]
         best_rmse = float("inf")
 
-    # Entrenamiento inicial con best params
     y_train_fit = np.log1p(y_train) if log1p else y_train
     y_test_true = y_test
     y_test_fit = np.log1p(y_test) if log1p else y_test
@@ -256,7 +275,6 @@ def train_one(
         verbose=False
     )
 
-    # Selección de features (si no vienen fijas) y re-entrenamiento final
     selected = fixed_features if fixed_features is not None else _pick_top_features(model, list(X.columns), top_k=top_k)
 
     X_train_s = X_train[selected]
@@ -278,12 +296,11 @@ def train_one(
     m["cv_rmse_mean"] = float(best_rmse)
     m["selected_features"] = int(len(selected))
     m["target_transform"] = "log1p" if log1p else "none"
-    m["best_params"] = {k: best_params[k] for k in best_params if k not in ("n_jobs",)}  # opcional
+    m["best_params"] = {k: best_params[k] for k in best_params if k not in ("n_jobs",)}
     return model2, m, selected
 
 
 def load_metrics(models_dir: str) -> dict:
-    """Lee metrics_latest.json si existe."""
     path = os.path.join(models_dir, "metrics_latest.json")
     if not os.path.exists(path):
         return {}
@@ -301,7 +318,6 @@ def save_artifacts(models_dir: str, model_r, model_c, features, metrics):
     booster_r = model_r.get_booster()
     booster_c = model_c.get_booster()
 
-    # latest
     booster_r.save_model(os.path.join(models_dir, "model_racimos_latest.json"))
     booster_c.save_model(os.path.join(models_dir, "model_cajas_latest.json"))
 
@@ -311,7 +327,6 @@ def save_artifacts(models_dir: str, model_r, model_c, features, metrics):
     with open(os.path.join(models_dir, "metrics_latest.json"), "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
-    # versionado por fecha
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     booster_r.save_model(os.path.join(models_dir, f"model_racimos_{stamp}.json"))
     booster_c.save_model(os.path.join(models_dir, f"model_cajas_{stamp}.json"))
@@ -338,20 +353,26 @@ def train_from_csv(csv_path: str, models_dir: str, granularity: str = "daily"):
     else:
         X, y_r, y_c, _features = preprocess(df)
 
-    # Entrenamos RACIMOS primero y usamos sus features seleccionadas
-    model_r, m1, selected = train_one(X, y_r, log1p=True, top_k=35)
-    # Entrenamos CAJAS con las mismas features (evita mismatch en inferencia)
-    model_c, m2, _ = train_one(X, y_c, log1p=True, fixed_features=selected)
+    # ✅ RACIMOS selecciona sus features
+    model_r, m1, selected_r = train_one(X, y_r, log1p=True, top_k=45)
+
+    # ✅ CAJAS selecciona sus propias features (no la amarres a racimos)
+    model_c, m2, selected_c = train_one(X, y_c, log1p=True, top_k=45)
+
+    # ✅ Para inferencia guardamos la unión para evitar mismatch
+    all_features = sorted(list(set(selected_r) | set(selected_c)))
 
     metrics = {
         "racimos": m1,
         "cajas": m2,
         "rows": int(len(df)),
-        "features_count": int(len(selected)),
+        "features_count": int(len(all_features)),
         "granularity": granularity,
+        "features_racimos": selected_r,
+        "features_cajas": selected_c,
     }
 
-    save_artifacts(models_dir, model_r, model_c, selected, metrics)
+    save_artifacts(models_dir, model_r, model_c, all_features, metrics)
     return metrics
 
 
