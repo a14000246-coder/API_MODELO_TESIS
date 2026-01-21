@@ -1,142 +1,34 @@
 import os
 import json
-import pandas as pd
-import numpy as np
-import xgboost as xgb
 from datetime import datetime
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
+
+# Targets (columnas obligatorias)
 TARGETS = ["RACIMOS COSECHADOS", "CAJAS PROCESADAS"]
 
+# Columnas que suelen venir con mala codificación en CSVs
+MOJIBAKE_MAP = {
+    "PrecipitaciÃ³n (%)": "Precipitación (%)",
+    "Precipitacion (%)": "Precipitación (%)",
+}
 
 # =========================
-# Preprocesamiento mensual (para proyección por meses)
+# Helpers
 # =========================
-def monthly_aggregate(df: pd.DataFrame) -> pd.DataFrame:
-    """Agrega el dataset a nivel mensual y crea lags/rolling para mejorar la variabilidad.
-    - Targets (RACIMOS COSECHADOS, CAJAS PROCESADAS): SUMA mensual.
-    - Otras variables: PROMEDIO mensual (ajusta a SUMA si corresponde en tu caso).
-    - Dirección del viento: moda mensual (si existe).
-    """
-    df = df.copy()
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
 
-    # ✅ Fix de nombres con mala codificación (mojibake)
-    df = df.rename(columns={
-        "PrecipitaciÃ³n (%)": "Precipitación (%)"
-    })
-
-    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
-    df = df.dropna(subset=["Fecha"]).sort_values("Fecha")
-
-    # Mes (inicio de mes)
-    df["MesFecha"] = df["Fecha"].dt.to_period("M").dt.to_timestamp()
-
-    sum_cols = [c for c in TARGETS if c in df.columns]
-
-    base_exclude = set(["Fecha", "MesFecha"])
-    agg_dict = {}
-
-    for c in df.columns:
-        if c in base_exclude:
-            continue
-
-        if c in sum_cols:
-            agg_dict[c] = "sum"
-        elif c == "Dirección del viento":
-            # la tratamos aparte
-            continue
-        elif c in ["Precipitación (%)", "Precipitacion (%)", "PrecipitaciÃ³n (%)"]:
-            # ✅ Es porcentaje -> promedio mensual, no suma
-            agg_dict[c] = "mean"
-        else:
-            # por defecto: promedio mensual
-            agg_dict[c] = "mean"
-
-    monthly = df.groupby("MesFecha", as_index=False).agg(agg_dict)
-
-    # Dirección del viento: moda mensual (opcional)
-    if "Dirección del viento" in df.columns:
-        def mode_or_nan(s):
-            s = s.dropna()
-            return s.mode().iloc[0] if len(s) else np.nan
-
-        wind = df.groupby("MesFecha")["Dirección del viento"].apply(mode_or_nan).reset_index()
-        monthly = monthly.merge(wind, on="MesFecha", how="left")
-
-    monthly = monthly.rename(columns={"MesFecha": "Fecha"}).sort_values("Fecha")
-
-    # ✅ Feature derivada: aproximación de "días con lluvia"
-    if "Precipitación (%)" in monthly.columns:
-        monthly["Dias_lluvia_aprox"] = (monthly["Precipitación (%)"].astype(float) / 100.0) * 30.0
-
-    # ============================
-    # LAGS MENSUALES (1,2,3,6,12)
-    # ============================
-    if TARGETS[0] in monthly.columns:
-        for lag in [1, 2, 3, 6, 12]:
-            monthly[f"{TARGETS[0]}_lag_{lag}m"] = monthly[TARGETS[0]].shift(lag)
-
-    if TARGETS[1] in monthly.columns:
-        for lag in [1, 2, 3, 6, 12]:
-            monthly[f"{TARGETS[1]}_lag_{lag}m"] = monthly[TARGETS[1]].shift(lag)
-
-    # ============================
-    # ROLLING MEAN (3,6,12 meses)
-    # ============================
-    if TARGETS[0] in monthly.columns:
-        for win in [3, 6, 12]:
-            monthly[f"{TARGETS[0]}_mm_{win}m"] = monthly[TARGETS[0]].rolling(win).mean()
-
-    if TARGETS[1] in monthly.columns:
-        for win in [3, 6, 12]:
-            monthly[f"{TARGETS[1]}_mm_{win}m"] = monthly[TARGETS[1]].rolling(win).mean()
-
-    # Calendario + estacionalidad cíclica
-    monthly["MES"] = monthly["Fecha"].dt.month
-    monthly["AÑO"] = monthly["Fecha"].dt.year
-    monthly["MES_sin"] = np.sin(2 * np.pi * monthly["MES"] / 12)
-    monthly["MES_cos"] = np.cos(2 * np.pi * monthly["MES"] / 12)
-
-    return monthly
-
-
-def preprocess_monthly(df: pd.DataFrame):
-    dfm = monthly_aggregate(df)
-
-    if "Dirección del viento" in dfm.columns:
-        dfm = pd.get_dummies(dfm, columns=["Dirección del viento"], drop_first=True)
-
-    dfm = dfm.dropna(subset=TARGETS)
-
-    features = [c for c in dfm.columns if c not in TARGETS + ["Fecha"]]
-    X = dfm[features]
-    y1 = dfm[TARGETS[0]]
-    y2 = dfm[TARGETS[1]]
-    return X, y1, y2, features
-
-
-def preprocess(df: pd.DataFrame):
-    df = df.copy()
-
-    # ✅ Fix de nombres con mala codificación (por si entrenas daily)
-    df = df.rename(columns={
-        "PrecipitaciÃ³n (%)": "Precipitación (%)"
-    })
-
-    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
-
-    if "Dirección del viento" in df.columns:
-        df = pd.get_dummies(df, columns=["Dirección del viento"], drop_first=True)
-
-    df = df.dropna(subset=TARGETS)
-
-    features = [c for c in df.columns if c not in TARGETS + ["Fecha"]]
-    X = df[features]
-    y1 = df[TARGETS[0]]
-    y2 = df[TARGETS[1]]
-    return X, y1, y2, features
-
+def load_metrics(models_dir: str) -> dict:
+    path = os.path.join(models_dir, "metrics_latest.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 def _metrics(y_true, y_pred):
     return {
@@ -145,9 +37,10 @@ def _metrics(y_true, y_pred):
         "r2": float(r2_score(y_true, y_pred)),
     }
 
-
 def _pick_top_features(model: xgb.XGBRegressor, feature_names: list[str], top_k: int = 45) -> list[str]:
-    """Selecciona features por GAIN (más estable que feature_importances_)."""
+    """
+    Selecciona features por GAIN (más estable que feature_importances_).
+    """
     try:
         booster = model.get_booster()
         score = booster.get_score(importance_type="gain")
@@ -162,18 +55,21 @@ def _pick_top_features(model: xgb.XGBRegressor, feature_names: list[str], top_k:
     except Exception:
         return feature_names[: min(top_k, len(feature_names))]
 
-
 def _train_with_params_ts(
     X: pd.DataFrame,
     y: pd.Series,
     params: dict,
     n_splits: int = 3,
-    log1p: bool = True
+    log1p: bool = True,
 ):
-    """Evalúa hiperparámetros con validación temporal (TimeSeriesSplit)."""
+    """
+    Evalúa hiperparámetros con validación temporal (TimeSeriesSplit).
+    Sin early stopping para compatibilidad con entornos que no aceptan callbacks/early_stopping_rounds.
+    """
+    # Con pocos puntos mensuales, 3 splits suele ser más estable que 5
     n_splits = min(n_splits, max(2, len(X) - 2))
     tscv = TimeSeriesSplit(n_splits=n_splits)
-    rmses = []
+    rmses: list[float] = []
 
     for train_idx, val_idx in tscv.split(X):
         X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
@@ -189,13 +85,7 @@ def _train_with_params_ts(
             y_val_fit = y_val
 
         m = xgb.XGBRegressor(**params)
-        # ✅ Sin early stopping (compatibilidad Render)
-        m.fit(
-            X_tr,
-            y_tr_fit,
-            eval_set=[(X_val, y_val_fit)],
-            verbose=False
-        )
+        m.fit(X_tr, y_tr_fit, eval_set=[(X_val, y_val_fit)], verbose=False)
 
         pred = m.predict(X_val)
         if log1p:
@@ -206,25 +96,152 @@ def _train_with_params_ts(
 
     return float(np.mean(rmses)) if rmses else float("inf")
 
+# =========================
+# Preprocesamiento
+# =========================
+def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df = df.rename(columns=MOJIBAKE_MAP)
+    return df
 
+def preprocess(df: pd.DataFrame):
+    """
+    Preprocesamiento DAILY:
+    - Respeta lags/rolling ya calculados en el CSV mejorado
+    - One-hot de Dirección del viento (si existe)
+    """
+    df = _standardize_columns(df)
+    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+    df = df.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+
+    # One-hot si existe
+    if "Dirección del viento" in df.columns:
+        df["Dirección del viento"] = df["Dirección del viento"].astype(str).replace({"nan": np.nan})
+        df["Dirección del viento"] = df["Dirección del viento"].fillna(df["Dirección del viento"].mode().iloc[0])
+        df = pd.get_dummies(df, columns=["Dirección del viento"], drop_first=True)
+
+    # Asegurar targets
+    df = df.dropna(subset=[c for c in TARGETS if c in df.columns])
+
+    # Features: todo menos targets y Fecha
+    features = [c for c in df.columns if c not in TARGETS + ["Fecha"]]
+    X = df[features]
+    y_r = df[TARGETS[0]]
+    y_c = df[TARGETS[1]]
+    return X, y_r, y_c, features
+
+def monthly_aggregate(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Agrega a nivel mensual y RE-CREA lags/rolling mensuales.
+    Importante para el CSV mejorado:
+    - El CSV ya trae columnas derivadas daily (lags/rolling) basadas en targets.
+      Para mensual las descartamos para evitar fuga de información y ruido.
+    """
+    df = _standardize_columns(df)
+    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+    df = df.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+
+    # 🔥 Eliminar columnas derivadas DAILY basadas en targets (excepto los targets)
+    # Ej: "RACIMOS COSECHADOS_mm_7", "RACIMOS COSECHADOS_lag_7", etc.
+    for t in TARGETS:
+        drop_like = [c for c in df.columns if c.startswith(f"{t}_")]
+        if drop_like:
+            df = df.drop(columns=drop_like, errors="ignore")
+
+    # Quitar columnas calendario si ya venían (las recalculamos)
+    for c in ["AÑO", "MES", "SEMANAS", "dia_anio", "Dia_J", "semana"]:
+        if c in df.columns:
+            df = df.drop(columns=[c])
+
+    # Mes (inicio de mes)
+    df["MesFecha"] = df["Fecha"].dt.to_period("M").dt.to_timestamp()
+
+    sum_cols = [c for c in TARGETS if c in df.columns]
+    base_exclude = {"Fecha", "MesFecha"}
+
+    agg_dict: dict[str, str] = {}
+    for c in df.columns:
+        if c in base_exclude:
+            continue
+        if c in sum_cols:
+            agg_dict[c] = "sum"
+        elif c == "Dirección del viento":
+            continue
+        elif c in ["Precipitación (%)"]:
+            # Porcentaje -> promedio mensual
+            agg_dict[c] = "mean"
+        else:
+            agg_dict[c] = "mean"
+
+    monthly = df.groupby("MesFecha", as_index=False).agg(agg_dict)
+
+    # Dirección del viento: moda mensual (si existe)
+    if "Dirección del viento" in df.columns:
+        def mode_or_nan(s):
+            s = s.dropna()
+            return s.mode().iloc[0] if len(s) else np.nan
+
+        wind = df.groupby("MesFecha")["Dirección del viento"].apply(mode_or_nan).reset_index()
+        monthly = monthly.merge(wind, on="MesFecha", how="left")
+
+    monthly = monthly.rename(columns={"MesFecha": "Fecha"}).sort_values("Fecha").reset_index(drop=True)
+
+    # Feature derivada lluvia por % (si existe)
+    if "Precipitación (%)" in monthly.columns and "Dias_lluvia_aprox" not in monthly.columns:
+        monthly["Dias_lluvia_aprox"] = (pd.to_numeric(monthly["Precipitación (%)"], errors="coerce").fillna(0) / 100.0) * 30.0
+
+    # Lags mensuales (1,2,3,6,12)
+    for t in TARGETS:
+        if t in monthly.columns:
+            for lag in [1, 2, 3, 6, 12]:
+                monthly[f"{t}_lag_{lag}m"] = monthly[t].shift(lag)
+
+    # Rolling mean (3,6,12)
+    for t in TARGETS:
+        if t in monthly.columns:
+            for win in [3, 6, 12]:
+                monthly[f"{t}_mm_{win}m"] = monthly[t].rolling(win).mean()
+
+    # Calendario + estacionalidad cíclica
+    monthly["MES"] = monthly["Fecha"].dt.month
+    monthly["AÑO"] = monthly["Fecha"].dt.year
+    monthly["MES_sin"] = np.sin(2 * np.pi * monthly["MES"] / 12)
+    monthly["MES_cos"] = np.cos(2 * np.pi * monthly["MES"] / 12)
+
+    return monthly
+
+def preprocess_monthly(df: pd.DataFrame):
+    dfm = monthly_aggregate(df)
+
+    if "Dirección del viento" in dfm.columns:
+        dfm["Dirección del viento"] = dfm["Dirección del viento"].astype(str).replace({"nan": np.nan})
+        dfm["Dirección del viento"] = dfm["Dirección del viento"].fillna(dfm["Dirección del viento"].mode().iloc[0])
+        dfm = pd.get_dummies(dfm, columns=["Dirección del viento"], drop_first=True)
+
+    dfm = dfm.dropna(subset=[c for c in TARGETS if c in dfm.columns])
+
+    features = [c for c in dfm.columns if c not in TARGETS + ["Fecha"]]
+    X = dfm[features]
+    y_r = dfm[TARGETS[0]]
+    y_c = dfm[TARGETS[1]]
+    return X, y_r, y_c, features
+
+# =========================
+# Entrenamiento
+# =========================
 def train_one(
     X: pd.DataFrame,
     y: pd.Series,
     *,
     log1p: bool = True,
     top_k: int = 45,
-    fixed_features: list[str] | None = None,
 ):
-    """Fase 1:
-    - Validación temporal (TimeSeriesSplit)
-    - Búsqueda pequeña de hiperparámetros
-    - Transformación log1p del target
-    - Selección de features por GAIN
     """
-
-    if fixed_features is not None:
-        X = X[fixed_features]
-
+    - CV temporal (3 splits)
+    - mini-búsqueda de hiperparámetros
+    - log1p del target (default)
+    - selección de features por GAIN
+    """
     # Split final (último 20% como test)
     split = int(len(X) * 0.8)
     X_train, X_test = X.iloc[:split], X.iloc[split:]
@@ -237,6 +254,7 @@ def train_one(
         "tree_method": "hist",
     }
 
+    # Livianos + regularizados (sin early stopping)
     candidates = [
         {**base, "learning_rate": 0.03, "max_depth": 6, "min_child_weight": 3,
          "subsample": 0.8, "colsample_bytree": 0.8, "gamma": 0.1,
@@ -267,26 +285,19 @@ def train_one(
     y_test_true = y_test
     y_test_fit = np.log1p(y_test) if log1p else y_test
 
+    # Entrenamiento inicial
     model = xgb.XGBRegressor(**best_params)
-    model.fit(
-        X_train,
-        y_train_fit,
-        eval_set=[(X_test, y_test_fit)],
-        verbose=False
-    )
+    model.fit(X_train, y_train_fit, eval_set=[(X_test, y_test_fit)], verbose=False)
 
-    selected = fixed_features if fixed_features is not None else _pick_top_features(model, list(X.columns), top_k=top_k)
+    # Selección de features
+    selected = _pick_top_features(model, list(X.columns), top_k=top_k)
 
+    # Re-entrenamiento final
     X_train_s = X_train[selected]
     X_test_s = X_test[selected]
 
     model2 = xgb.XGBRegressor(**best_params)
-    model2.fit(
-        X_train_s,
-        y_train_fit,
-        eval_set=[(X_test_s, y_test_fit)],
-        verbose=False
-    )
+    model2.fit(X_train_s, y_train_fit, eval_set=[(X_test_s, y_test_fit)], verbose=False)
 
     pred = model2.predict(X_test_s)
     if log1p:
@@ -298,19 +309,6 @@ def train_one(
     m["target_transform"] = "log1p" if log1p else "none"
     m["best_params"] = {k: best_params[k] for k in best_params if k not in ("n_jobs",)}
     return model2, m, selected
-
-
-def load_metrics(models_dir: str) -> dict:
-    path = os.path.join(models_dir, "metrics_latest.json")
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
 
 def save_artifacts(models_dir: str, model_r, model_c, features, metrics):
     ensure_dir(models_dir)
@@ -331,7 +329,6 @@ def save_artifacts(models_dir: str, model_r, model_c, features, metrics):
     booster_r.save_model(os.path.join(models_dir, f"model_racimos_{stamp}.json"))
     booster_c.save_model(os.path.join(models_dir, f"model_cajas_{stamp}.json"))
 
-
 def load_latest(models_dir: str):
     mr = xgb.Booster()
     mc = xgb.Booster()
@@ -344,43 +341,40 @@ def load_latest(models_dir: str):
 
     return mr, mc, features
 
-
 def train_from_csv(csv_path: str, models_dir: str, granularity: str = "daily"):
-    df = pd.read_csv(csv_path)
+    # BOM-friendly read
+    df = pd.read_csv(csv_path, encoding="utf-8-sig")
 
     if granularity == "monthly":
-        X, y_r, y_c, _features = preprocess_monthly(df)
+        X, y_r, y_c, _ = preprocess_monthly(df)
     else:
-        X, y_r, y_c, _features = preprocess(df)
+        X, y_r, y_c, _ = preprocess(df)
 
-    # ✅ RACIMOS selecciona sus features
-    model_r, m1, selected_r = train_one(X, y_r, log1p=True, top_k=45)
+    # Entrena cada target con sus propias features y guarda la UNIÓN para inferencia
+    model_r, m1, feats_r = train_one(X, y_r, log1p=True, top_k=45)
+    model_c, m2, feats_c = train_one(X, y_c, log1p=True, top_k=45)
 
-    # ✅ CAJAS selecciona sus propias features (no la amarres a racimos)
-    model_c, m2, selected_c = train_one(X, y_c, log1p=True, top_k=45)
-
-    # ✅ Para inferencia guardamos la unión para evitar mismatch
-    all_features = sorted(list(set(selected_r) | set(selected_c)))
+    all_features = sorted(list(set(feats_r) | set(feats_c)))
 
     metrics = {
         "racimos": m1,
         "cajas": m2,
         "rows": int(len(df)),
-        "features_count": int(len(all_features)),
         "granularity": granularity,
-        "features_racimos": selected_r,
-        "features_cajas": selected_c,
+        "features_count": int(len(all_features)),
+        "features_racimos": feats_r,
+        "features_cajas": feats_c,
     }
 
     save_artifacts(models_dir, model_r, model_c, all_features, metrics)
     return metrics
-
 
 def predict_from_row(models_dir: str, row: dict):
     mr, mc, features = load_latest(models_dir)
     meta = load_metrics(models_dir)
 
     X = pd.DataFrame([row])
+    X = _standardize_columns(X)
 
     for col in features:
         if col not in X.columns:
